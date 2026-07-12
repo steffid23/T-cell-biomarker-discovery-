@@ -149,10 +149,13 @@ class GraphRegShallowAttention(nn.Module):
         return Y_hat, alpha
 
 
-def train_model(X, L_sym, y, n_epochs=150, lr=1e-3, gamma=0.1, lambda_l1=1e-4):
+def train_model(X, L_sym, y, train_idx=None, n_epochs=150, lr=1e-3, gamma=0.1, lambda_l1=1e-4):
     X = X.to(device)
     L_sym = L_sym.to(device)
     y = y.to(device)
+
+    if train_idx is not None:
+        train_idx = torch.LongTensor(train_idx).to(device)
 
     n_features = X.shape[1]
     n_classes = len(torch.unique(y))
@@ -168,7 +171,12 @@ def train_model(X, L_sym, y, n_epochs=150, lr=1e-3, gamma=0.1, lambda_l1=1e-4):
 
         Y_hat, alpha = model(X)
 
-        loss_ce = F.cross_entropy(Y_hat, y)
+        # Graph regularization uses the full graph (transductive), but the
+        # supervised loss only sees training-set labels when a split is given.
+        if train_idx is not None:
+            loss_ce = F.cross_entropy(Y_hat[train_idx], y[train_idx])
+        else:
+            loss_ce = F.cross_entropy(Y_hat, y)
         loss_reg = gamma * torch.trace(Y_hat.T @ L_sym @ Y_hat)
         loss_l1 = lambda_l1 * torch.sum(torch.abs(model.theta))
 
@@ -186,14 +194,7 @@ def train_model(X, L_sym, y, n_epochs=150, lr=1e-3, gamma=0.1, lambda_l1=1e-4):
     return model, tel
 
 
-def evaluate_and_plot(model, X, y, var_names, out_dir, prefix="full_model"):
-    model.eval()
-    with torch.no_grad():
-        Y_hat, alpha = model(X.to(device))
-        Y_pred = torch.argmax(Y_hat, dim=1).cpu().numpy()
-        Y_prob = Y_hat.cpu().numpy()
-        y_true = y.cpu().numpy()
-
+def _compute_metrics(y_true, Y_pred, Y_prob):
     ari = adjusted_rand_score(y_true, Y_pred)
     nmi = normalized_mutual_info_score(y_true, Y_pred)
     f1 = f1_score(y_true, Y_pred, average='macro')
@@ -201,15 +202,32 @@ def evaluate_and_plot(model, X, y, var_names, out_dir, prefix="full_model"):
         roc = roc_auc_score(y_true, Y_prob, multi_class='ovr')
     except Exception:
         roc = np.nan
+    return ari, nmi, f1, roc
 
-    metrics = {
-        "Model": prefix,
-        "ARI": ari,
-        "NMI": nmi,
-        "F1_Macro": f1,
-        "ROC_AUC": roc
-    }
-    print(f"Metrics for {prefix}: ARI={ari:.4f}, NMI={nmi:.4f}, F1={f1:.4f}, ROC={roc:.4f}")
+
+def evaluate_and_plot(model, X, y, var_names, out_dir, prefix="full_model",
+                       train_idx=None, test_idx=None):
+    model.eval()
+    with torch.no_grad():
+        Y_hat, alpha = model(X.to(device))
+        Y_pred = torch.argmax(Y_hat, dim=1).cpu().numpy()
+        Y_prob = Y_hat.cpu().numpy()
+        y_true = y.cpu().numpy()
+
+    metrics = {"Model": prefix}
+
+    if test_idx is not None:
+        ari, nmi, f1, roc = _compute_metrics(y_true[test_idx], Y_pred[test_idx], Y_prob[test_idx])
+        metrics.update({"Test_ARI": ari, "Test_NMI": nmi, "Test_F1_Macro": f1, "Test_ROC_AUC": roc})
+        print(f"[Held-out test] {prefix}: ARI={ari:.4f}, NMI={nmi:.4f}, F1={f1:.4f}, ROC={roc:.4f}")
+
+        ari_tr, nmi_tr, f1_tr, roc_tr = _compute_metrics(y_true[train_idx], Y_pred[train_idx], Y_prob[train_idx])
+        metrics.update({"Train_ARI": ari_tr, "Train_NMI": nmi_tr, "Train_F1_Macro": f1_tr, "Train_ROC_AUC": roc_tr})
+        print(f"[Train] {prefix}: ARI={ari_tr:.4f}, NMI={nmi_tr:.4f}, F1={f1_tr:.4f}, ROC={roc_tr:.4f}")
+    else:
+        ari, nmi, f1, roc = _compute_metrics(y_true, Y_pred, Y_prob)
+        metrics.update({"ARI": ari, "NMI": nmi, "F1_Macro": f1, "ROC_AUC": roc})
+        print(f"Metrics for {prefix} (no held-out split): ARI={ari:.4f}, NMI={nmi:.4f}, F1={f1:.4f}, ROC={roc:.4f}")
 
     alpha_np = alpha.cpu().numpy()
     top_k = min(1500, len(alpha_np))
@@ -250,6 +268,9 @@ def main():
     parser.add_argument("--prefix", type=str, default="Model_Full")
     parser.add_argument("--out-dir", type=str, default="outputs")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval-split", type=float, default=0.0,
+                         help="Held-out fraction for honest evaluation (e.g. 0.2). "
+                              "0.0 keeps the original full-data behavior.")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -260,11 +281,23 @@ def main():
         args.h5ad, label_col=args.label_col, k_neighbors=args.k_neighbors
     )
 
+    train_idx, test_idx = None, None
+    if args.eval_split > 0:
+        from sklearn.model_selection import train_test_split
+        all_idx = np.arange(len(y))
+        train_idx, test_idx = train_test_split(
+            all_idx, test_size=args.eval_split, stratify=y.numpy(), random_state=args.seed
+        )
+
     model, tel = train_model(
-        X, L_sym, y, n_epochs=args.epochs, lr=args.lr, gamma=args.gamma, lambda_l1=args.lambda_l1
+        X, L_sym, y, train_idx=train_idx,
+        n_epochs=args.epochs, lr=args.lr, gamma=args.gamma, lambda_l1=args.lambda_l1
     )
 
-    metrics = evaluate_and_plot(model, X, y, var_names, args.out_dir, prefix=args.prefix)
+    metrics = evaluate_and_plot(
+        model, X, y, var_names, args.out_dir, prefix=args.prefix,
+        train_idx=train_idx, test_idx=test_idx
+    )
 
     pd.DataFrame([metrics]).to_csv(os.path.join(args.out_dir, f"{args.prefix}_Metrics.csv"), index=False)
     pd.DataFrame([tel]).to_csv(os.path.join(args.out_dir, f"{args.prefix}_Telemetry.csv"), index=False)
